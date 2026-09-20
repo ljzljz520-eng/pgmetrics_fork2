@@ -72,6 +72,7 @@ PostgreSQL Cluster:
 		getSetting(result, "server_version"),
 		fmtTimeAndSince(result.StartTime),
 	)
+	writeCollectionIntegrity(fd, result)
 	if version >= pgv96 {
 		fmt.Fprintf(fd, `
     System Identifier:   %s
@@ -1488,6 +1489,7 @@ pgmetrics run at: %s
 `,
 		fmtTimeAndSince(result.Metadata.At),
 	)
+	writeCollectionIntegrity(fd, result)
 
 	// databases
 	fmt.Fprintf(fd, `
@@ -1591,6 +1593,7 @@ Pgpool Version:   %s
 `,
 		fmtTimeAndSince(result.Metadata.At), result.Pgpool.Version,
 	)
+	writeCollectionIntegrity(fd, result)
 
 	// backends
 	var tw tableWriter
@@ -1641,6 +1644,62 @@ func fmtTime(at int64) string {
 		return ""
 	}
 	return time.Unix(at, 0).Format("2 Jan 2006 3:04:05 PM")
+}
+
+// fmtIntegrityTime formats a microsecond epoch value; zero renders as "-".
+func fmtIntegrityTime(us int64) string {
+	if us == 0 {
+		return "-"
+	}
+	return time.UnixMicro(us).UTC().Format("2 Jan 2006 15:04:05.000000 UTC")
+}
+
+// writeCollectionIntegrity emits the timing and completeness contract block
+// shared by the human reports for postgres, pgbouncer and pgpool.
+func writeCollectionIntegrity(fd io.Writer, result *pgmetrics.Model) {
+	c := result.Collection
+	if c == nil {
+		return
+	}
+
+	limit := "disabled"
+	if c.MaxAllowedSkew > 0 {
+		limit = (time.Duration(c.MaxAllowedSkew) * time.Microsecond).String()
+	}
+	skewNote := ""
+	if c.MaxAllowedSkew > 0 && c.MaxSkew > c.MaxAllowedSkew {
+		skewNote = ", EXCEEDED"
+	}
+	stale := "disabled"
+	if c.MaxStale > 0 {
+		stale = (time.Duration(c.MaxStale) * time.Microsecond).String()
+	}
+
+	fmt.Fprintf(fd, `
+Collection Integrity:
+    Anchor:              %s
+    Overall Window:      %s .. %s (span %s)
+    Max Clock Skew:      %s (limit %s%s)
+    Max Stale Allowed:   %s
+    Status:              %s`,
+		fmtIntegrityTime(c.AnchorTime),
+		fmtIntegrityTime(c.WindowStart),
+		fmtIntegrityTime(c.WindowEnd),
+		(time.Duration(c.WindowEnd-c.WindowStart) * time.Microsecond).String(),
+		(time.Duration(c.MaxSkew) * time.Microsecond).String(),
+		limit, skewNote,
+		stale,
+		strings.ToUpper(c.Status),
+	)
+	if c.CancelReason != "" {
+		fmt.Fprintf(fd, `
+    Cancel Reason:       %s`, c.CancelReason)
+	}
+	if len(c.OutOfBounds) > 0 {
+		fmt.Fprintf(fd, `
+    Out-of-bounds:       %s`, strings.Join(c.OutOfBounds, ", "))
+	}
+	fmt.Fprintln(fd)
 }
 
 func fmtTimeAndSince(at int64) string {

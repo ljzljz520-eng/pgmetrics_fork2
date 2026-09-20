@@ -123,6 +123,28 @@ func model2csv(m *pgmetrics.Model, w *csv.Writer) (err error) {
 		struct2csv("pgmetrics.system.", *(m.System), w)
 	}
 
+	// collection integrity contract (timing, skew, freshness, completeness)
+	if ci := m.Collection; ci != nil {
+		// scalar fields (slices are emitted explicitly below)
+		struct2csv("pgmetrics.collection.", *ci, w)
+
+		rec2csv("pgmetrics.collection.source.count", strconv.Itoa(len(ci.Sources)), w)
+		for i, s := range ci.Sources {
+			struct2csv(fmt.Sprintf("pgmetrics.collection.source.%d.", i), s, w)
+		}
+
+		rec2csv("pgmetrics.collection.domain.count", strconv.Itoa(len(ci.Domains)), w)
+		for i, d := range ci.Domains {
+			struct2csv(fmt.Sprintf("pgmetrics.collection.domain.%d.", i), d, w)
+		}
+
+		rec2csv("pgmetrics.collection.out_of_bounds.count",
+			strconv.Itoa(len(ci.OutOfBounds)), w)
+		for i, name := range ci.OutOfBounds {
+			rec2csv(fmt.Sprintf("pgmetrics.collection.out_of_bounds.%d", i), name, w)
+		}
+	}
+
 	// note: sequences, user functions, extensions, disabled triggers, statements,
 	// roles, blocking pids, publications, subscriptions and settings are not
 	// written to the csv as of now inorder to keep csv size small.

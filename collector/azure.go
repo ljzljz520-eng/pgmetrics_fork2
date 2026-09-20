@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/monitor/armmonitor"
 	"github.com/rapidloop/pgmetrics"
@@ -37,7 +38,28 @@ const (
 
 var rxResource = regexp.MustCompile(`(?i)^/subscriptions/([^/]{36})/resourceGroups/([^/]+)/providers/Microsoft.DBforPostgreSQL/(flexibleServers|servers|serverGroupsv2)/([^/]+)$`)
 
-func collectAzure(ctx context.Context, resourceID string, out *pgmetrics.Azure) error {
+// azureMetricsLister is the Azure Monitor surface used by collection; tests
+// replace the factory to inject a fake lister.
+type azureMetricsLister interface {
+	List(ctx context.Context, resourceURI string,
+		options *armmonitor.MetricsClientListOptions) (armmonitor.MetricsClientListResponse, error)
+}
+
+// newAzureMetricsClient is overridable by tests.
+var newAzureMetricsClient = func(subID string, cred azcore.TokenCredential) (azureMetricsLister, error) {
+	return armmonitor.NewMetricsClient(subID, cred, nil)
+}
+
+// newAzureCredential is overridable by tests.
+var newAzureCredential = func() (azcore.TokenCredential, error) {
+	return azidentity.NewDefaultAzureCredential(nil)
+}
+
+func collectAzure(ctx context.Context, anchor time.Time, maxStale time.Duration,
+	resourceID string, out *pgmetrics.Azure) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// parse resource URI
 	m := rxResource.FindStringSubmatch(resourceID)
@@ -47,21 +69,22 @@ func collectAzure(ctx context.Context, resourceID string, out *pgmetrics.Azure) 
 	out.ResourceType = "Microsoft.DBforPostgreSQL/" + m[3]
 	out.ResourceName = m[4]
 	out.Metrics = make(map[string]float64)
+	out.MetricTimes = make(map[string]int64)
 
 	// get credentials
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	cred, err := newAzureCredential()
 	if err != nil {
 		return fmt.Errorf("failed to get credentials: %v", err)
 	}
 
 	// create a client
-	client, err := armmonitor.NewMetricsClient(m[1], cred, nil)
+	client, err := newAzureMetricsClient(m[1], cred)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %v", err)
 	}
 
-	// make parameters for query
-	to := time.Now().In(time.UTC)
+	// make parameters for query; the timespan ends at the common anchor
+	to := anchor.In(time.UTC)
 	from := to.Add(-5 * time.Minute)
 	timeRange := from.Format(time.RFC3339) + "/" + to.Format(time.RFC3339)
 	var interval string
@@ -95,40 +118,89 @@ func collectAzure(ctx context.Context, resourceID string, out *pgmetrics.Azure) 
 	}
 
 	// parse response
-	out.ResourceRegion = *resp.Resourceregion
-	for _, m := range resp.Value {
-		if m.ID == nil || *m.ID == "" {
-			// log.Printf("warning: ignoring metric with no id: %v", m)
+	if resp.Resourceregion != nil {
+		out.ResourceRegion = *resp.Resourceregion
+	}
+
+	var selectedTimes []time.Time
+	var newestSample time.Time
+	for _, metric := range resp.Value {
+		if metric.ID == nil || *metric.ID == "" {
 			continue
 		}
-		if len(m.Timeseries) == 0 {
-			continue // no timeseries data, ignore quietly
+		name := azGetMetricName(*metric.ID)
+
+		// gather every data point carrying a usable value, then select the
+		// point whose PROVIDER timestamp is closest to the anchor; value
+		// preference is Average -> Total -> Maximum at the chosen point.
+		type point struct {
+			ts  time.Time
+			val float64
 		}
-		ts := m.Timeseries[len(m.Timeseries)-1]
-		if len(ts.Data) == 0 {
-			continue // no timeseries data, ignore quietly
-		}
-		name := azGetMetricName(*m.ID)
-		for i := len(ts.Data) - 1; i >= 0; i-- {
-			t := ts.Data[i]
-			if t.TimeStamp == nil {
+		var candidates []point
+		var candidateTimes []time.Time
+		for _, series := range metric.Timeseries {
+			if series == nil {
 				continue
 			}
-			if t.Average != nil {
-				out.Metrics[name] = *t.Average
-				break
+			for _, d := range series.Data {
+				if d == nil || d.TimeStamp == nil {
+					continue
+				}
+				var v float64
+				switch {
+				case d.Average != nil:
+					v = *d.Average
+				case d.Total != nil:
+					v = *d.Total
+				case d.Maximum != nil:
+					v = *d.Maximum
+				default:
+					continue
+				}
+				ts := d.TimeStamp.In(time.UTC)
+				candidates = append(candidates, point{ts: ts, val: v})
+				candidateTimes = append(candidateTimes, ts)
 			}
-			if t.Total != nil {
-				out.Metrics[name] = *t.Total
-				break
-			}
-			if t.Maximum != nil {
-				out.Metrics[name] = *t.Maximum
-				break
-			}
+		}
+		if len(candidates) == 0 {
+			continue // no usable data for this metric, skip quietly
+		}
+		_, idx, ok := selectClosest(anchor, candidateTimes)
+		if !ok {
+			continue
+		}
+		sel := candidates[idx]
+		out.Metrics[name] = sel.val
+		out.MetricTimes[name] = sel.ts.UnixMicro()
+		selectedTimes = append(selectedTimes, sel.ts)
+		if sel.ts.After(newestSample) {
+			newestSample = sel.ts
 		}
 	}
 
+	if len(selectedTimes) == 0 {
+		out.Status = pgmetrics.StatusUnavailable
+		return nil
+	}
+	lo, hi := selectedTimes[0], selectedTimes[0]
+	for _, t := range selectedTimes[1:] {
+		if t.Before(lo) {
+			lo = t
+		}
+		if t.After(hi) {
+			hi = t
+		}
+	}
+	best, _, _ := selectClosest(anchor, selectedTimes)
+	out.SampleTime = best.UnixMicro()
+	out.WindowStart = lo.UnixMicro()
+	out.WindowEnd = hi.UnixMicro()
+	if maxStale > 0 && anchor.Sub(newestSample) > maxStale {
+		out.Status = pgmetrics.StatusStale
+	} else {
+		out.Status = pgmetrics.StatusOK
+	}
 	return nil
 }
 

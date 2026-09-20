@@ -29,11 +29,14 @@ import (
 
 func (c *collector) collectPgpool() {
 	c.result.Pgpool = &pgmetrics.Pgpool{}
-	semversion := c.getPPVersion()
-	c.getPPNodes()
-	c.getPPHCStats(semversion)
-	c.getPPBEStats(semversion)
-	c.getPPCache()
+	// pgpool has no transactional catalog API: every domain is an
+	// observation annotated with its own window.
+	var semversion string
+	c.observed("pool_version", func() { semversion = c.getPPVersion() })
+	c.observed("pool_nodes", c.getPPNodes)
+	c.observed("health_check_stats", func() { c.getPPHCStats(semversion) })
+	c.observed("backend_stats", func() { c.getPPBEStats(semversion) })
+	c.observed("pool_cache", c.getPPCache)
 }
 
 /*
@@ -43,12 +46,12 @@ func (c *collector) collectPgpool() {
  */
 
 func (c *collector) getPPVersion() string {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	// get raw version
 	var version string
-	if err := c.db.QueryRowContext(ctx, "SHOW POOL_VERSION").Scan(&version); err != nil {
+	if err := c.q.QueryRowContext(ctx, "SHOW POOL_VERSION").Scan(&version); err != nil {
 		log.Fatalf("pgpool: show pool_version query failed: %v", err)
 	}
 
@@ -81,10 +84,10 @@ func (c *collector) getPPVersion() string {
  */
 
 func (c *collector) getPPNodes() {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW POOL_NODES")
+	rows, err := c.q.QueryContext(ctx, "SHOW POOL_NODES")
 	if err != nil {
 		log.Fatalf("pgpool: show pool_nodes query failed: %v", err)
 	}
@@ -159,10 +162,10 @@ func (c *collector) getPPHCStats(semversion string) {
 		return // no health check stats
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW POOL_HEALTH_CHECK_STATS")
+	rows, err := c.q.QueryContext(ctx, "SHOW POOL_HEALTH_CHECK_STATS")
 	if err != nil {
 		log.Fatalf("pgpool: show pool_health_check_stats query failed: %v", err)
 	}
@@ -231,10 +234,10 @@ func (c *collector) getPPBEStats(semversion string) {
 		return // no backend stats
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW POOL_BACKEND_STATS")
+	rows, err := c.q.QueryContext(ctx, "SHOW POOL_BACKEND_STATS")
 	if err != nil {
 		log.Fatalf("pgpool: show pool_backend_stats query failed: %v", err)
 	}
@@ -295,10 +298,10 @@ func (c *collector) getPPBEStats(semversion string) {
  */
 
 func (c *collector) getPPCache() {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW POOL_CACHE")
+	rows, err := c.q.QueryContext(ctx, "SHOW POOL_CACHE")
 	if err != nil {
 		log.Fatalf("pgpool: show pool_cache query failed: %v", err)
 	}

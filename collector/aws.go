@@ -17,6 +17,7 @@
 package collector
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
@@ -33,8 +35,36 @@ import (
 	"github.com/rapidloop/pgmetrics"
 )
 
+// minimal AWS API surfaces, so that tests can inject fakes
+
+type cwAPI interface {
+	ListMetricsWithContext(ctx context.Context, in *cloudwatch.ListMetricsInput,
+		opts ...request.Option) (*cloudwatch.ListMetricsOutput, error)
+	GetMetricDataPagesWithContext(ctx context.Context, in *cloudwatch.GetMetricDataInput,
+		fn func(page *cloudwatch.GetMetricDataOutput, lastPage bool) bool,
+		opts ...request.Option) error
+}
+
+type cwlogsAPI interface {
+	GetLogEventsWithContext(ctx context.Context, in *cloudwatchlogs.GetLogEventsInput,
+		opts ...request.Option) (*cloudwatchlogs.GetLogEventsOutput, error)
+}
+
+type rdsAPI interface {
+	DescribeDBInstancesWithContext(ctx context.Context, in *rds.DescribeDBInstancesInput,
+		opts ...request.Option) (*rds.DescribeDBInstancesOutput, error)
+	DescribeDBLogFilesPagesWithContext(ctx context.Context, in *rds.DescribeDBLogFilesInput,
+		fn func(page *rds.DescribeDBLogFilesOutput, lastPage bool) bool,
+		opts ...request.Option) error
+	DownloadDBLogFilePortionWithContext(ctx context.Context, in *rds.DownloadDBLogFilePortionInput,
+		opts ...request.Option) (*rds.DownloadDBLogFilePortionOutput, error)
+}
+
 type awsCollector struct {
 	sess *session.Session
+	cw   cwAPI
+	cwl  cwlogsAPI
+	rdsc rdsAPI
 }
 
 func newAwsCollector() (*awsCollector, error) {
@@ -44,13 +74,29 @@ func newAwsCollector() (*awsCollector, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &awsCollector{sess: sess}, nil
+	return &awsCollector{
+		sess: sess,
+		cw:   cloudwatch.New(sess),
+		cwl:  cloudwatchlogs.New(sess),
+		rdsc: rds.New(sess),
+	}, nil
 }
 
-func (ac *awsCollector) collect(dbid string, out *pgmetrics.RDS) (err error) {
+// newAwsCollectorFn is the factory used by collection; tests replace it to
+// inject fake AWS clients.
+var newAwsCollectorFn = newAwsCollector
+
+func (ac *awsCollector) collect(ctx context.Context, anchor time.Time,
+	maxStale time.Duration, dbid string, out *pgmetrics.RDS) (err error) {
+	if err = ctx.Err(); err != nil {
+		return
+	}
+
+	out.Basic = map[string]float64{}
+	out.BasicTimes = map[string]int64{}
+
 	// describe the db instance
-	rdssvc := rds.New(ac.sess)
-	dbinsts, err := rdssvc.DescribeDBInstances(&rds.DescribeDBInstancesInput{
+	dbinsts, err := ac.rdsc.DescribeDBInstancesWithContext(ctx, &rds.DescribeDBInstancesInput{
 		DBInstanceIdentifier: aws.String(dbid),
 	})
 	if err != nil {
@@ -67,8 +113,7 @@ func (ac *awsCollector) collect(dbid string, out *pgmetrics.RDS) (err error) {
 	emEnabled := *dbinst.MonitoringInterval > 0
 
 	// list available metrics
-	cwsvc := cloudwatch.New(ac.sess)
-	avmetrics, err := cwsvc.ListMetrics(&cloudwatch.ListMetricsInput{
+	avmetrics, err := ac.cw.ListMetricsWithContext(ctx, &cloudwatch.ListMetricsInput{
 		Namespace: aws.String("AWS/RDS"),
 		Dimensions: []*cloudwatch.DimensionFilter{
 			{
@@ -105,7 +150,10 @@ func (ac *awsCollector) collect(dbid string, out *pgmetrics.RDS) (err error) {
 			},
 		}
 	}
-	to := time.Now()
+
+	// query window ends at the common anchor; provider timestamps are what
+	// matter for selection, not our request time
+	to := anchor
 	from := to.Add(-5 * time.Minute)
 	input := &cloudwatch.GetMetricDataInput{
 		StartTime:         aws.Time(from),
@@ -114,60 +162,122 @@ func (ac *awsCollector) collect(dbid string, out *pgmetrics.RDS) (err error) {
 		MetricDataQueries: queries,
 	}
 
-	// actually get metrics
-	err = cwsvc.GetMetricDataPages(input, func(page *cloudwatch.GetMetricDataOutput, lastPage bool) bool {
-		for _, r := range page.MetricDataResults {
-			if len(r.Timestamps) >= 1 && len(r.Values) >= 1 {
-				if id, err := strconv.Atoi(strings.TrimPrefix(*r.Id, "id")); err == nil && id >= 0 && id < len(names) {
-					name := names[id]
-					val := *r.Values[0]
-					if len(out.Basic) == 0 {
-						out.Basic = map[string]float64{name: val}
-					} else {
-						out.Basic[name] = val
+	// per-metric: pick the sample whose PROVIDER timestamp is closest to the
+	// anchor, and keep that timestamp
+	var selectedTimes []time.Time
+	var newestSample time.Time
+	if err = ac.cw.GetMetricDataPagesWithContext(ctx, input,
+		func(page *cloudwatch.GetMetricDataOutput, lastPage bool) bool {
+			for _, r := range page.MetricDataResults {
+				n := len(r.Timestamps)
+				if len(r.Values) < n {
+					n = len(r.Values)
+				}
+				if n == 0 {
+					continue
+				}
+				id, perr := strconv.Atoi(strings.TrimPrefix(aws.StringValue(r.Id), "id"))
+				if perr != nil || id < 0 || id >= len(names) {
+					continue
+				}
+				tsCand := make([]time.Time, 0, n)
+				for i := 0; i < n; i++ {
+					if r.Timestamps[i] != nil && r.Values[i] != nil {
+						tsCand = append(tsCand, *r.Timestamps[i])
 					}
 				}
+				_, idx, ok := selectClosest(anchor, tsCand)
+				if !ok {
+					continue
+				}
+				ts := tsCand[idx]
+				// recover the value aligned with the chosen timestamp
+				var val float64
+				for i := 0; i < n; i++ {
+					if r.Timestamps[i] != nil && *r.Timestamps[i] == ts {
+						val = *r.Values[i]
+						break
+					}
+				}
+				name := names[id]
+				out.Basic[name] = val
+				out.BasicTimes[name] = ts.UnixMicro()
+				selectedTimes = append(selectedTimes, ts)
+				if ts.After(newestSample) {
+					newestSample = ts
+				}
 			}
-		}
-		return true
-	})
-	if err != nil {
+			return true
+		}); err != nil {
 		err = fmt.Errorf("failed to get CloudWatch metric data: %v", err)
 		return
 	}
 
-	// if enhanced monitoring is not enabled, we are done
-	if !emEnabled {
-		return
+	// enhanced monitoring: keep the provider event timestamp as well
+	if emEnabled {
+		events, gerr := ac.cwl.GetLogEventsWithContext(ctx,
+			&cloudwatchlogs.GetLogEventsInput{
+				EndTime:       aws.Int64(anchor.Unix() * 1000),
+				Limit:         aws.Int64(1),
+				LogGroupName:  aws.String("RDSOSMetrics"),
+				LogStreamName: aws.String(dbirid),
+				StartFromHead: aws.Bool(false),
+			})
+		if gerr != nil {
+			err = fmt.Errorf("failed to get CloudWatchLog events: %v", gerr)
+			return
+		}
+		if len(events.Events) > 0 && events.Events[0].Message != nil &&
+			len(*events.Events[0].Message) > 0 {
+			if events.Events[0].Timestamp != nil {
+				out.EnhancedAt = *events.Events[0].Timestamp * 1000 // ms -> us
+				et := time.UnixMicro(out.EnhancedAt)
+				selectedTimes = append(selectedTimes, et)
+				if et.After(newestSample) {
+					newestSample = et
+				}
+			}
+			if uerr := json.Unmarshal([]byte(*events.Events[0].Message),
+				&out.Enhanced); uerr != nil {
+				err = fmt.Errorf("failed to decode event: %v", uerr)
+				return
+			}
+		}
 	}
 
-	// get last log event
-	cwlsvc := cloudwatchlogs.New(ac.sess)
-	events, err := cwlsvc.GetLogEvents(&cloudwatchlogs.GetLogEventsInput{
-		EndTime:       aws.Int64(time.Now().Unix() * 1000),
-		Limit:         aws.Int64(1),
-		LogGroupName:  aws.String("RDSOSMetrics"),
-		LogStreamName: aws.String(dbirid),
-		StartFromHead: aws.Bool(false),
-	})
-	if err != nil {
-		err = fmt.Errorf("failed to get CloudWatchLog events: %v", err)
+	// status and window from the data the provider actually returned
+	if len(selectedTimes) == 0 {
+		out.Status = pgmetrics.StatusUnavailable
 		return
 	}
-	if len(events.Events) == 0 || events.Events[0].Message == nil || len(*events.Events[0].Message) == 0 {
-		return // didn't find any usable event, ignore
+	lo, hi := selectedTimes[0], selectedTimes[0]
+	for _, t := range selectedTimes[1:] {
+		if t.Before(lo) {
+			lo = t
+		}
+		if t.After(hi) {
+			hi = t
+		}
 	}
-	if err = json.Unmarshal([]byte(*events.Events[0].Message), &out.Enhanced); err != nil {
-		err = fmt.Errorf("failed to decode event: %v", err)
-		return
+	best, _, _ := selectClosest(anchor, selectedTimes)
+	out.SampleTime = best.UnixMicro()
+	out.WindowStart = lo.UnixMicro()
+	out.WindowEnd = hi.UnixMicro()
+	if maxStale > 0 && anchor.Sub(newestSample) > maxStale {
+		out.Status = pgmetrics.StatusStale
+	} else {
+		out.Status = pgmetrics.StatusOK
 	}
-
 	return
 }
 
-func (ac *awsCollector) collectLogs(dbid string, start time.Time, cb func(lines []byte)) (err error) {
+func (ac *awsCollector) collectLogs(ctx context.Context, dbid string,
+	start time.Time, cb func(lines []byte)) (err error) {
 	if len(dbid) == 0 || cb == nil {
 		return errors.New("internal error, bad input")
+	}
+	if err = ctx.Err(); err != nil {
+		return
 	}
 
 	type logFilesType struct {
@@ -176,26 +286,26 @@ func (ac *awsCollector) collectLogs(dbid string, start time.Time, cb func(lines 
 	}
 
 	// describe db log files
-	rdssvc := rds.New(ac.sess)
 	input := &rds.DescribeDBLogFilesInput{
 		DBInstanceIdentifier: aws.String(dbid),
 		FileLastWritten:      aws.Int64(start.Unix() * 1000),
 	}
 	var logFiles []logFilesType
-	err = rdssvc.DescribeDBLogFilesPages(input, func(page *rds.DescribeDBLogFilesOutput, lastPage bool) bool {
-		if page == nil {
-			return false // should not happen
-		}
-		for _, d := range page.DescribeDBLogFiles {
-			if d != nil && d.LastWritten != nil && d.LogFileName != nil {
-				logFiles = append(logFiles, logFilesType{
-					name: *d.LogFileName,
-					last: time.Unix(*d.LastWritten/1000, *d.LastWritten%1000),
-				})
+	err = ac.rdsc.DescribeDBLogFilesPagesWithContext(ctx, input,
+		func(page *rds.DescribeDBLogFilesOutput, lastPage bool) bool {
+			if page == nil {
+				return false // should not happen
 			}
-		}
-		return true
-	})
+			for _, d := range page.DescribeDBLogFiles {
+				if d != nil && d.LastWritten != nil && d.LogFileName != nil {
+					logFiles = append(logFiles, logFilesType{
+						name: *d.LogFileName,
+						last: time.Unix(*d.LastWritten/1000, *d.LastWritten%1000),
+					})
+				}
+			}
+			return true
+		})
 	if err != nil {
 		err = fmt.Errorf("failed to DescribeDBLogFilesPages: %v", err)
 		return
@@ -208,19 +318,22 @@ func (ac *awsCollector) collectLogs(dbid string, start time.Time, cb func(lines 
 
 	// download db log file portion
 	for _, lf := range logFiles {
+		if err = ctx.Err(); err != nil {
+			return
+		}
 		marker := "0"
 		done := false
 		var lines []byte
 		for !done {
-			output, err := rdssvc.DownloadDBLogFilePortion(
+			output, derr := ac.rdsc.DownloadDBLogFilePortionWithContext(ctx,
 				&rds.DownloadDBLogFilePortionInput{
 					DBInstanceIdentifier: aws.String(dbid),
 					LogFileName:          aws.String(lf.name),
 					Marker:               aws.String(marker),
 				},
 			)
-			if err != nil {
-				return fmt.Errorf("failed to DownloadDBLogFilePortionPages: %v", err)
+			if derr != nil {
+				return fmt.Errorf("failed to DownloadDBLogFilePortionPages: %v", derr)
 			}
 			if output == nil || output.LogFileData == nil || output.Marker == nil ||
 				output.AdditionalDataPending == nil {

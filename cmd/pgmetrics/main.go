@@ -40,6 +40,15 @@ Usage:
 General options:
   -t, --timeout=SECS           individual query timeout in seconds (default: 5)
       --lock-timeout=MILLIS    lock timeout in milliseconds (default: 50)
+      --max-skew=SECS          mark the run degraded when a source clock or data
+                                   time deviates from the common anchor by more
+                                   than SECS (default: 300, 0 disables the check)
+      --max-stale=SECS         max age of a cloud (AWS/Azure) sample accepted as
+                                   fresh; older samples are "stale" and missing
+                                   ones "unavailable" (default: 300, 0 disables)
+      --snapshot-hold=MILLIS   max wall-clock duration the catalog/statistics
+                                   snapshot transactions may be held (default:
+                                   10000, 0 disables the hold limit)
   -i, --input=FILE             don't connect to db, instead read and display
                                    this previously saved JSON file
   -V, --version                output version information, then exit
@@ -207,6 +216,9 @@ func (o *options) parse() (args []string) {
 	// general
 	s.UintVarLong(&o.CollectConfig.TimeoutSec, "timeout", 't', "")
 	s.UintVarLong(&o.CollectConfig.LockTimeoutMillisec, "lock-timeout", 0, "")
+	s.UintVarLong(&o.CollectConfig.MaxSkewSec, "max-skew", 0, "")
+	s.UintVarLong(&o.CollectConfig.MaxStaleSec, "max-stale", 0, "")
+	s.UintVarLong(&o.CollectConfig.MaxSnapshotHoldMillisec, "snapshot-hold", 0, "")
 	s.BoolVarLong(&o.CollectConfig.NoSizes, "no-sizes", 'S', "")
 	s.StringVarLong(&o.input, "input", 'i', "")
 	help := s.StringVarLong(&o.help, "help", '?', "").SetOptional()

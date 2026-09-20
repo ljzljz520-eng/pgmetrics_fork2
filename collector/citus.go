@@ -69,12 +69,12 @@ func (c *collector) getCitus(currdb string, fillSize bool) {
 }
 
 func (c *collector) getCitusVersion(currdb string, major *int) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	var cv string
 	q := `SELECT citus_version()`
-	if err := c.db.QueryRowContext(ctx, q).Scan(&cv); err != nil {
+	if err := c.q.QueryRowContext(ctx, q).Scan(&cv); err != nil {
 		log.Printf("warning: citus_version() in db %q failed:: %v", currdb, err)
 		return
 	}
@@ -86,11 +86,11 @@ func (c *collector) getCitusVersion(currdb string, major *int) {
 }
 
 func (c *collector) getCitusTableSizes(currdb string) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	q := `SELECT logicalrelid::oid, citus_table_size(logicalrelid) FROM pg_dist_partition`
-	rows, err := c.db.QueryContext(ctx, q)
+	rows, err := c.q.QueryContext(ctx, q)
 	if err != nil {
 		log.Printf("warning: pg_dist_partition/citus_table_size query failed: %v", err)
 		return
@@ -117,13 +117,13 @@ func (c *collector) getCitusTableSizes(currdb string) {
 }
 
 func (c *collector) getCitusNodes(currdb string) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	q := `SELECT nodeid, groupid, nodename, nodeport, COALESCE(noderack, ''),
                  isactive, noderole, nodecluster, shouldhaveshards
             FROM pg_dist_node`
-	rows, err := c.db.QueryContext(ctx, q)
+	rows, err := c.q.QueryContext(ctx, q)
 	if err != nil {
 		log.Printf("warning: pg_dist_node query failed: %v", err)
 		return
@@ -147,12 +147,12 @@ func (c *collector) getCitusNodes(currdb string) {
 
 // citus_stat_statements
 func (c *collector) getCitusStatements(currdb string) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	q := `SELECT queryid, userid, dbid, query, executor, COALESCE(partition_key, ''), calls
             FROM citus_stat_statements`
-	rows, err := c.db.QueryContext(ctx, q)
+	rows, err := c.q.QueryContext(ctx, q)
 	if err != nil {
 		if strings.Contains(err.Error(), "Citus Enterprise") {
 			err = nil // silently ignore this "error"
@@ -178,7 +178,7 @@ func (c *collector) getCitusStatements(currdb string) {
 }
 
 func (c *collector) getCitusBackendsv11() []pgmetrics.CitusBackendV11 {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	q := `SELECT COALESCE(datname, ''), COALESCE(usename, ''),
@@ -195,7 +195,7 @@ func (c *collector) getCitusBackendsv11() []pgmetrics.CitusBackendV11 {
 			COALESCE(is_worker_query, false), COALESCE(query_id, 0),
 			COALESCE(backend_type, '')
 		  FROM citus_stat_activity ORDER BY pid ASC`
-	rows, err := c.db.QueryContext(ctx, q, c.sqlLength)
+	rows, err := c.q.QueryContext(ctx, q, c.sqlLength)
 	if err != nil {
 		log.Printf("warning: citus_stat_activity query failed: %v", err)
 		return nil
@@ -223,7 +223,7 @@ func (c *collector) getCitusBackendsv11() []pgmetrics.CitusBackendV11 {
 }
 
 func (c *collector) getCitusBackends(table string) []pgmetrics.CitusBackend {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	q := `SELECT COALESCE(datname, ''), COALESCE(usename, ''),
@@ -243,7 +243,7 @@ func (c *collector) getCitusBackends(table string) []pgmetrics.CitusBackend {
 			COALESCE(EXTRACT(EPOCH FROM transaction_stamp)::bigint, 0)
 		  FROM %s ORDER BY pid ASC`
 	q = fmt.Sprintf(q, table)
-	rows, err := c.db.QueryContext(ctx, q, c.sqlLength)
+	rows, err := c.q.QueryContext(ctx, q, c.sqlLength)
 	if err != nil {
 		log.Printf("warning: %s query failed: %v", table, err)
 		return nil
@@ -282,7 +282,7 @@ func (c *collector) getCitusActivity(currdb string, major int) {
 
 // citus_lock_waits
 func (c *collector) getCitusLocks(currdb string, majorVer int) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	var q string
@@ -299,7 +299,7 @@ func (c *collector) getCitusLocks(currdb string, majorVer int) {
 	          FROM citus_lock_waits`
 	}
 
-	rows, err := c.db.QueryContext(ctx, q)
+	rows, err := c.q.QueryContext(ctx, q)
 	if err != nil {
 		log.Printf("warning: citus_lock_waits query failed: %v", err)
 		return
@@ -352,10 +352,10 @@ SELECT p.logicalrelid::oid::int AS table_oid,
 `
 
 func (c *collector) getCitusTables(currdb string) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, citusTablesSQL)
+	rows, err := c.q.QueryContext(ctx, citusTablesSQL)
 	if err != nil {
 		log.Printf("warning: citus tables query failed: %v", err)
 		return
@@ -378,11 +378,11 @@ func (c *collector) getCitusTables(currdb string) {
 }
 
 func (c *collector) getCitusNodeIDs(currdb string) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
 	q := `SELECT COALESCE(citus_coordinator_nodeid(), 0), COALESCE(citus_backend_gpid(), 0)/10000000000`
-	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.Citus[currdb].CoordinatorNodeID,
+	if err := c.q.QueryRowContext(ctx, q).Scan(&c.result.Citus[currdb].CoordinatorNodeID,
 		&c.result.Citus[currdb].ConnectedNodeID); err != nil {
 		log.Printf("warning: citus_coordinator_nodeid()/citus_backend_gpid() query failed: %v", err)
 	}

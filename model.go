@@ -19,6 +19,9 @@ package pgmetrics
 // ModelSchemaVersion is the schema version of the "Model" data structure
 // defined below. It is in the "semver" notation. Version history:
 //
+//	1.22 - Collection integrity contract: common anchor, per-domain/source
+//	       timing windows, skew, freshness and degraded/incomplete status;
+//	       AWS/Azure provider sample timestamps and stale/unavailable status
 //	1.21 - Postgres 19 support
 //	1.20 - Add subscription conflict stats, IO stats, pgbouncer 1.25 support
 //	1.19 - Postgres 18 support
@@ -42,13 +45,34 @@ package pgmetrics
 //	1.2 - more table and index attributes
 //	1.1 - added NotificationQueueUsage and Statements
 //	1.0 - initial release
-const ModelSchemaVersion = "1.21"
+const ModelSchemaVersion = "1.22"
+
+// Collection/source/domain status values, added in schema 1.22.
+const (
+	StatusOK          = "ok"          // domain/source collected with fresh data
+	StatusStale       = "stale"       // data exists but is older than the freshness limit
+	StatusUnavailable = "unavailable" // no usable data/sample was returned
+	StatusDegraded    = "degraded"    // overall: skew or freshness threshold exceeded
+	StatusIncomplete  = "incomplete"  // overall: canceled, skipped domains or failed snapshot groups
+	StatusError       = "error"       // domain/source collection failed
+	StatusSkipped     = "skipped"     // domain not started (canceled or snapshot-hold cutoff)
+)
+
+// Domain consistency classes, added in schema 1.22.
+const (
+	ClassSnapshot = "snapshot" // collected inside a read-only REPEATABLE READ tx
+	ClassObserved = "observed" // live view, annotated with an observation window only
+)
 
 // Model contains the entire information collected by a single run of
 // pgmetrics. It can be converted to and from json without loss of
 // precision.
 type Model struct {
 	Metadata Metadata `json:"meta"` // metadata about this object
+
+	// Collection integrity contract, present only in schema 1.22 and later.
+	// Nil for models loaded from older JSON files.
+	Collection *CollectionIntegrity `json:"collection,omitempty"`
 
 	StartTime        int64  `json:"start_time"`        // of postmaster
 	SystemIdentifier string `json:"system_identifier"` // from pg_control
@@ -912,6 +936,24 @@ type Deadlock struct {
 type RDS struct {
 	Basic    map[string]float64     `json:"basic"`              // Basic Monitoring Metrics
 	Enhanced map[string]interface{} `json:"enhanced,omitempty"` // Enhanced Monitoring
+
+	// following fields are present only in schema 1.22 and later
+
+	// BasicTimes maps each basic metric name to the provider (CloudWatch)
+	// timestamp of the sample that was selected, as microseconds since epoch.
+	BasicTimes map[string]int64 `json:"basic_times,omitempty"`
+	// EnhancedAt is the provider timestamp of the enhanced monitoring event,
+	// as microseconds since epoch.
+	EnhancedAt int64 `json:"enhanced_at,omitempty"`
+	// SampleTime is the provider timestamp of the selected sample closest to
+	// the collection anchor, as microseconds since epoch.
+	SampleTime int64 `json:"sample_time_us,omitempty"`
+	// WindowStart/WindowEnd are the earliest/latest provider timestamps among
+	// the selected basic metric samples, microseconds since epoch.
+	WindowStart int64 `json:"window_start_us,omitempty"`
+	WindowEnd   int64 `json:"window_end_us,omitempty"`
+	// Status is one of StatusOK, StatusStale or StatusUnavailable.
+	Status string `json:"status,omitempty"`
 }
 
 // Citus contains metrics collected from Citus extension.
@@ -1030,6 +1072,21 @@ type Azure struct {
 	ResourceType   string             `json:"resource_type"`
 	ResourceRegion string             `json:"resource_region"`
 	Metrics        map[string]float64 `json:"metrics"`
+
+	// following fields are present only in schema 1.22 and later
+
+	// MetricTimes maps each metric name to the provider (Azure Monitor)
+	// timestamp of the selected data point, microseconds since epoch.
+	MetricTimes map[string]int64 `json:"metric_times,omitempty"`
+	// SampleTime is the provider timestamp of the selected point closest to
+	// the collection anchor, microseconds since epoch.
+	SampleTime int64 `json:"sample_time_us,omitempty"`
+	// WindowStart/WindowEnd are the earliest/latest provider timestamps among
+	// the selected metric points, microseconds since epoch.
+	WindowStart int64 `json:"window_start_us,omitempty"`
+	WindowEnd   int64 `json:"window_end_us,omitempty"`
+	// Status is one of StatusOK, StatusStale or StatusUnavailable.
+	Status string `json:"status,omitempty"`
 }
 
 // AnalyzeProgressBackend represents a row (and each row represents one
@@ -1301,4 +1358,102 @@ type StatRecovery struct {
 	RecoveryLastXactTime  int64  `json:"recovery_last_xact_time"`
 	CurrentChunkStartTime int64  `json:"current_chunk_start_time"`
 	PauseState            string `json:"pause_state"`
+}
+
+// CollectionIntegrity is the timing and completeness contract for a single
+// pgmetrics run. All times are wall-clock values; microsecond-precision
+// fields end in "_us". Added in schema 1.22.
+type CollectionIntegrity struct {
+	// StartedAt/FinishedAt are seconds since epoch (collection machine clock).
+	StartedAt  int64 `json:"started_at"`
+	FinishedAt int64 `json:"finished_at,omitempty"`
+
+	// AnchorTime is the common anchor all sources are compared against, as
+	// microseconds since epoch.
+	AnchorTime int64 `json:"anchor_time_us"`
+
+	// WindowStart/WindowEnd are the earliest/latest data source times across
+	// all sources and domains that produced data, microseconds since epoch.
+	WindowStart int64 `json:"window_start_us,omitempty"`
+	WindowEnd   int64 `json:"window_end_us,omitempty"`
+
+	// MaxSkew is the largest absolute deviation of any source data time from
+	// the anchor; MaxAllowedSkew is the configured limit. Microseconds.
+	MaxSkew        int64 `json:"max_skew_us"`
+	MaxAllowedSkew int64 `json:"max_allowed_skew_us"`
+	// MaxStale is the configured maximum age of a cloud sample for it to be
+	// considered fresh. Microseconds.
+	MaxStale int64 `json:"max_stale_us,omitempty"`
+
+	// Status is one of StatusOK, StatusDegraded or StatusIncomplete.
+	Status string `json:"status"`
+	// Complete is false when the run was canceled or some domains/sources
+	// could not be collected.
+	Complete bool `json:"complete"`
+	// CancelReason is non-empty when the parent context ended the run.
+	CancelReason string `json:"cancel_reason,omitempty"`
+
+	OutOfBounds []string       `json:"out_of_bounds,omitempty"`
+	Sources     []SourceTiming `json:"sources,omitempty"`
+	Domains     []DomainTiming `json:"domains,omitempty"`
+}
+
+// SourceTiming records the request interval and data source time range of one
+// collection source (one PostgreSQL database, the AWS RDS API, the Azure API,
+// the local host metrics or log files). Added in schema 1.22.
+type SourceTiming struct {
+	Name string `json:"name"` // database name, "aws-rds", "azure", "system", "logs"
+	Kind string `json:"kind"` // "postgres", "aws", "azure", "system" or "logs"
+
+	// RequestStart/RequestEnd bracket the wall-clock interval in which
+	// requests to this source were in flight; microseconds since epoch.
+	RequestStart int64 `json:"request_start_us"`
+	RequestEnd   int64 `json:"request_end_us,omitempty"`
+	// RequestDuration is measured with the monotonic clock; microseconds.
+	RequestDuration int64 `json:"request_duration_us,omitempty"`
+
+	// DataStart/DataEnd bracket the actual data times reported by the source
+	// (server clock for PostgreSQL, provider timestamps for cloud APIs).
+	DataStart int64 `json:"data_start_us,omitempty"`
+	DataEnd   int64 `json:"data_end_us,omitempty"`
+
+	// ClockOffset is the measured offset of the source clock relative to the
+	// collection machine clock (source - local) at connection time.
+	ClockOffset int64 `json:"clock_offset_us,omitempty"`
+
+	// Status is one of the Status* constants.
+	Status string `json:"status"`
+}
+
+// DomainTiming records the request interval, observation window, data source
+// time and freshness of one collection domain. Added in schema 1.22.
+type DomainTiming struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	// Class is ClassSnapshot or ClassObserved.
+	Class string `json:"class"`
+
+	// RequestStart/RequestEnd bracket the in-flight interval (wall clock).
+	RequestStart int64 `json:"request_start_us"`
+	RequestEnd   int64 `json:"request_end_us"`
+	// RequestDuration is measured with the monotonic clock; microseconds.
+	RequestDuration int64 `json:"request_duration_us"`
+
+	// WindowStart/WindowEnd are the data source times for which the domain
+	// data is valid. For snapshot domains they equal the snapshot time; for
+	// observed domains they bracket the server-clock observation interval.
+	WindowStart int64 `json:"window_start_us,omitempty"`
+	WindowEnd   int64 `json:"window_end_us,omitempty"`
+
+	// DataTime is the representative data source time; Freshness is
+	// anchor - DataTime (negative when data is in the future). Microseconds.
+	DataTime  int64 `json:"data_time_us,omitempty"`
+	Freshness int64 `json:"freshness_us,omitempty"`
+
+	// SnapshotID is the PostgreSQL snapshot id shared by all domains of one
+	// snapshot group; empty for observed domains.
+	SnapshotID string `json:"snapshot_id,omitempty"`
+
+	// Status is one of the Status* constants.
+	Status string `json:"status"`
 }

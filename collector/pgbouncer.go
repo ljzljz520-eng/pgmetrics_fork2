@@ -29,11 +29,13 @@ import (
 
 func (c *collector) collectPgBouncer() {
 	c.result.PgBouncer = &pgmetrics.PgBouncer{}
-	c.getPBPools()
-	c.getPBServers()
-	c.getPBClients()
-	c.getPBStats()
-	c.getPBDatabases()
+	// pgbouncer has no transactional catalog API: every domain is an
+	// observation annotated with its own window.
+	c.observed("pools", c.getPBPools)
+	c.observed("servers", c.getPBServers)
+	c.observed("clients", c.getPBClients)
+	c.observed("stats", c.getPBStats)
+	c.observed("databases", c.getPBDatabases)
 }
 
 /*
@@ -61,10 +63,10 @@ func (c *collector) collectPgBouncer() {
  */
 
 func (c *collector) getPBPools() {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW POOLS")
+	rows, err := c.q.QueryContext(ctx, "SHOW POOLS")
 	if err != nil {
 		log.Fatalf("pgbouncer: show pools query failed: %v", err)
 	}
@@ -145,10 +147,10 @@ func (c *collector) getPBPools() {
  */
 
 func (c *collector) getPBServers() {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW SERVERS")
+	rows, err := c.q.QueryContext(ctx, "SHOW SERVERS")
 	if err != nil {
 		log.Fatalf("pgbouncer: show servers query failed: %v", err)
 	}
@@ -239,10 +241,10 @@ func (c *collector) getPBServers() {
  */
 
 func (c *collector) getPBClients() {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW CLIENTS")
+	rows, err := c.q.QueryContext(ctx, "SHOW CLIENTS")
 	if err != nil {
 		log.Fatalf("pgbouncer: show clients query failed: %v", err)
 	}
@@ -341,10 +343,10 @@ func (c *collector) getPBClients() {
  */
 
 func (c *collector) getPBStats() {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW STATS")
+	rows, err := c.q.QueryContext(ctx, "SHOW STATS")
 	if err != nil {
 		log.Fatalf("pgbouncer: show stats query failed: %v", err)
 	}
@@ -428,10 +430,10 @@ func (c *collector) getPBStats() {
  */
 
 func (c *collector) getPBDatabases() {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	ctx, cancel := context.WithTimeout(c.effCtx(), c.timeout)
 	defer cancel()
 
-	rows, err := c.db.QueryContext(ctx, "SHOW DATABASES")
+	rows, err := c.q.QueryContext(ctx, "SHOW DATABASES")
 	if err != nil {
 		log.Fatalf("pgbouncer: show databases query failed: %v", err)
 	}
